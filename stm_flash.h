@@ -1,6 +1,6 @@
 /**
  * @file    stm_flash.h
- * @brief   STM32H7 OCTOSPI W25Q256JV-IQ 阻塞式存储接口
+ * @brief   外部串行 NOR Flash 通用阻塞式存储接口
  */
 #ifndef STM_FLASH_H
 #define STM_FLASH_H
@@ -17,32 +17,65 @@
 extern "C" {
 #endif
 
-#define STM_FLASH_VERSION "2.0.0"
+#define STM_FLASH_VERSION "3.0.0"
 
 #define FLASH_ERR_BASE ((stm_err_t)0x1000)
 #define FLASH_ERR_PROTECTED (FLASH_ERR_BASE + 1) // 擦写保护有效
 #define FLASH_ERR_NEEDS_ERASE (FLASH_ERR_BASE + 2) // 写入包含 0 到 1 的变化
 #define FLASH_ERR_SUSPENDED (FLASH_ERR_BASE + 3) // 芯片存在挂起操作
 
-#define FLASH_SIZE_BYTES (32UL * 1024UL * 1024UL)
-#define FLASH_PAGE_BYTES 256U
-#define FLASH_SECTOR_BYTES 4096U
-#define FLASH_JEDEC_ID 0xEF4019UL
+// 仅 OSPI 后端已实现；其他值预留，创建时返回 NOT_SUPPORTED。
+typedef enum { FLASH_BUS_OSPI = 0, FLASH_BUS_SPI = 1, FLASH_BUS_QSPI = 2 } flash_bus_type_t;
+typedef struct {
+    flash_bus_type_t type;
+    union {
+        void *ospi; // OSPI_HandleTypeDef*；仅后端依赖具体 HAL 类型
+        void *spi;  // 预留
+        void *qspi; // 预留
+    } handle;
+} flash_bus_config_t;
 
 typedef enum {
-    FLASH_READ_SINGLE = 1, // 1-1-1，13h，无空周期
-    FLASH_READ_QUAD = 4    // 1-1-4，6Ch，8 个空周期
+    FLASH_CHIP_AUTO = 0,
+    FLASH_CHIP_W25Q256JV_IQ = 1
+} flash_chip_t;
+
+#define FLASH_CAP_READ_SINGLE (1UL << 0)
+#define FLASH_CAP_READ_QUAD   (1UL << 1)
+#define FLASH_CAP_PROGRAM    (1UL << 2)
+#define FLASH_CAP_ERASE      (1UL << 3)
+#define FLASH_STATUS_BUSY          (1UL << 0)
+#define FLASH_STATUS_WRITE_ENABLED (1UL << 1)
+#define FLASH_STATUS_PROTECTED     (1UL << 2)
+#define FLASH_STATUS_SUSPENDED     (1UL << 3)
+#define FLASH_STATUS_QUAD_ENABLED  (1UL << 4)
+
+typedef struct {
+    uint32_t valid_mask; // 本器件可查询的状态；未声明的位不能解释为 false
+    uint32_t flags;      // FLASH_STATUS_*；PROTECTED 表示组件应拒绝擦写
+} flash_status_t;
+
+typedef enum {
+    FLASH_READ_SINGLE = 1, // 1-1-1，指令与空周期由器件决定
+    FLASH_READ_QUAD = 4    // 1-1-4，指令与空周期由器件决定
 } flash_read_mode_t;
 
 typedef struct flash_context *flash_handle_t;
 
 typedef struct {
-    OSPI_HandleTypeDef *hal; // 已初始化并在句柄使用期间保持有效的 HAL 外设
+    flash_bus_config_t bus; // 已初始化且在对象生命周期内有效的总线
+    flash_chip_t chip; // AUTO 仅匹配已适配的器件，不猜测未知芯片
     flash_read_mode_t read_mode; // 单线或四线读取
 } flash_config_t;
 
 // 可通过 get_info 查询的只读快照
 typedef struct {
+    flash_chip_t chip;             // 实际匹配的型号
+    flash_bus_type_t bus_type;
+    uint32_t size_bytes;           // 容量
+    uint32_t page_size;            // 页编程边界
+    uint32_t erase_size;           // 公共擦除接口的最小对齐单位
+    uint32_t capabilities;         // FLASH_CAP_*
     uint32_t jedec_id;             // 24 位 JEDEC ID
     uint32_t clock_hz;             // 根据 HAL 配置计算的串行时钟，Hz
     HAL_StatusTypeDef last_hal_status;    // 最近一次 HAL 返回值
@@ -74,12 +107,12 @@ stm_err_t flash_delete(flash_handle_t *handle);
 stm_err_t flash_get_info(flash_handle_t handle, flash_info_t *info);
 
 /**
- * @brief 读取三个状态寄存器
+ * @brief 查询通用设备状态，不等待 BUSY 清零；失败不修改输出
  * @param dev 已初始化的实例
- * @param status 输出 SR1、SR2、SR3 的三个字节
+ * @param status 输出支持掩码和状态位；各寄存器依次读取，不是原子快照
  * @return STM_OK 或访问错误
  */
-stm_err_t flash_read_status(flash_handle_t dev, uint8_t status[3]);
+stm_err_t flash_get_status(flash_handle_t dev, flash_status_t *status);
 
 /**
  * @brief 从 Flash 读取数据
@@ -104,8 +137,8 @@ stm_err_t flash_write(flash_handle_t dev, uint32_t offset_bytes, const void *dat
 /**
  * @brief 擦除并检查全 FF，失败时此前的扇区可能已擦除
  * @param dev 已初始化的实例
- * @param offset_bytes 4 KiB 对齐的字节偏移
- * @param size_bytes 4 KiB 的整数倍，零长度不发送命令
+ * @param offset_bytes 按 info.erase_size 对齐的字节偏移
+ * @param size_bytes info.erase_size 的整数倍，零长度不发送命令
  * @return STM_OK 或对齐、保护、通信、校验错误
  */
 stm_err_t flash_erase(flash_handle_t dev, uint32_t offset_bytes, size_t size_bytes);

@@ -6,6 +6,7 @@
 #include "tests/test_allocator.h"
 
 #define CHECK(x) do { if (!(x)) { return __LINE__; } } while (0)
+#define FLASH_SIZE_BYTES (32UL * 1024UL * 1024UL) // NOR 模型容量，独立于驱动参数表
 #define MEMORY ((uint8_t *)0xD0000000UL)
 static OSPI_RegularCmdTypeDef command;
 static uint8_t registers[3], identity[3];
@@ -17,7 +18,7 @@ static HAL_StatusTypeDef injected;
 // 用简短测试配置调用公开创建接口
 static stm_err_t create_device(flash_handle_t *out, OSPI_HandleTypeDef *hal, flash_read_mode_t value)
 {
-    const flash_config_t config = {.hal = hal, .read_mode = value};
+    const flash_config_t config = {.bus = {.type = FLASH_BUS_OSPI, .handle.ospi = hal}, .chip = FLASH_CHIP_AUTO, .read_mode = value};
     return flash_create(&config, out);
 }
 
@@ -245,10 +246,10 @@ int test_entry(void)
     CHECK(flash_read(d, 0U, rx, 1U) == STM_ERR_TIMEOUT && !info(d).ready);
     h = fixture(); flash_delete(&d);
     h.Init.DeviceSize = 24U;
-    CHECK(create_device(&d, &h, FLASH_READ_QUAD) == STM_ERR_INVALID_CONFIG && calls == 0U);
-    h.Init.DeviceSize = 25U; h.Init.ClockPrescaler = 1U;
     CHECK(create_device(&d, &h, FLASH_READ_QUAD) == STM_ERR_INVALID_CONFIG);
-    h.Init.ClockPrescaler = 8U;
+    calls = 0U; h.Init.DeviceSize = 25U; h.Init.ClockPrescaler = 1U;
+    CHECK(create_device(&d, &h, FLASH_READ_QUAD) == STM_ERR_INVALID_CONFIG);
+    calls = 0U; h.Init.ClockPrescaler = 8U;
     __HAL_RCC_OSPI_CONFIG(RCC_OSPICLKSOURCE_PLL2);
     CHECK(create_device(&d, &h, FLASH_READ_QUAD) == STM_ERR_INVALID_CONFIG && calls == 0U);
     __HAL_RCC_OSPI_CONFIG(RCC_OSPICLKSOURCE_HCLK);
@@ -309,7 +310,7 @@ int test_handle_entry(void)
 {
     OSPI_HandleTypeDef h = fixture();
     flash_handle_t d = NULL, second = NULL;
-    flash_config_t config = {.hal = &h, .read_mode = FLASH_READ_QUAD};
+    flash_config_t config = {.bus = {.type = FLASH_BUS_OSPI, .handle.ospi = &h}, .chip = FLASH_CHIP_AUTO, .read_mode = FLASH_READ_QUAD};
     CHECK(flash_create(NULL, &d) == STM_ERR_INVALID_ARG && d == NULL);
     CHECK(flash_create(&config, NULL) == STM_ERR_INVALID_ARG);
     CHECK(flash_get_info(NULL, NULL) == STM_ERR_INVALID_ARG);
@@ -319,7 +320,7 @@ int test_handle_entry(void)
     allocation_failure = 0;
     for (unsigned cycle = 0; cycle < 20U; ++cycle) {
         h = fixture();
-        config.hal = &h;
+        config.bus.handle.ospi = &h;
         config.read_mode = FLASH_READ_QUAD;
         CHECK(flash_create(&config, &d) == STM_OK && d != NULL);
         CHECK(live_allocations == 1U);
@@ -327,10 +328,10 @@ int test_handle_entry(void)
         uint32_t before = calls;
         CHECK(flash_create(&config, &d) == STM_ERR_INVALID_STATE && d == saved);
         OSPI_HandleTypeDef alias = h;
-        config.hal = &alias;
+        config.bus.handle.ospi = &alias;
         CHECK(flash_create(&config, &second) == STM_ERR_INVALID_STATE && second == NULL);
         CHECK(calls == before && live_allocations == 1U);
-        config.hal = NULL;
+        config.bus.handle.ospi = NULL;
         config.read_mode = 0;
         CHECK(info(d).ready);
         CHECK(flash_get_info(d, NULL) == STM_ERR_INVALID_ARG);
@@ -359,9 +360,9 @@ int test_multiple_handles_entry(void)
     OSPI_HandleTypeDef h1 = fixture(), h2 = h1;
     h2.Instance = OCTOSPI2;
     flash_handle_t first = NULL, second = NULL, third = NULL;
-    flash_config_t config = {.hal = &h1, .read_mode = FLASH_READ_SINGLE};
+    flash_config_t config = {.bus = {.type = FLASH_BUS_OSPI, .handle.ospi = &h1}, .chip = FLASH_CHIP_AUTO, .read_mode = FLASH_READ_SINGLE};
     CHECK(flash_create(&config, &first) == STM_OK);
-    config.hal = &h2;
+    config.bus.handle.ospi = &h2;
     CHECK(flash_create(&config, &second) == STM_OK && second != first);
     CHECK(live_allocations == 2U);
     CHECK(flash_delete(&first) == STM_OK && first == NULL);
@@ -370,5 +371,52 @@ int test_multiple_handles_entry(void)
     CHECK(flash_delete(&second) == STM_OK && live_allocations == 0U);
     CHECK(flash_create(&config, &third) == STM_OK);
     CHECK(flash_delete(&third) == STM_OK && live_allocations == 0U && invalid_frees == 0U);
+    return 0;
+}
+
+// 验证 v3 型号选择、能力查询、状态语义和失败输出契约。
+int test_v3_entry(void)
+{
+    OSPI_HandleTypeDef h = fixture();
+    flash_handle_t d = NULL;
+    flash_config_t config = {
+        .bus = {.type = FLASH_BUS_OSPI, .handle.ospi = &h},
+        .chip = FLASH_CHIP_W25Q256JV_IQ, .read_mode = FLASH_READ_QUAD,
+    };
+    config.bus.type = FLASH_BUS_SPI;
+    CHECK(flash_create(&config, &d) == STM_ERR_NOT_SUPPORTED && calls == 0U && d == NULL);
+    config.bus.type = FLASH_BUS_QSPI;
+    CHECK(flash_create(&config, &d) == STM_ERR_NOT_SUPPORTED && calls == 0U);
+    config.bus.type = FLASH_BUS_OSPI;
+    kernel = 400000001U;
+    CHECK(flash_create(&config, &d) == STM_ERR_INVALID_CONFIG && calls == 0U);
+    kernel = 275000000U;
+    config.chip = (flash_chip_t)99;
+    CHECK(flash_create(&config, &d) == STM_ERR_NOT_SUPPORTED && live_allocations == 0U);
+    CHECK(calls == 2U && programs == 0U && erases == 0U);
+    config.chip = FLASH_CHIP_W25Q256JV_IQ;
+    h = fixture(); identity[2] = 0x18U;
+    CHECK(flash_create(&config, &d) == STM_ERR_NOT_SUPPORTED && d == NULL && calls == 2U);
+    h = fixture();
+    CHECK(flash_create(&config, &d) == STM_OK);
+    flash_info_t properties = info(d);
+    CHECK(properties.chip == FLASH_CHIP_W25Q256JV_IQ && properties.bus_type == FLASH_BUS_OSPI);
+    CHECK(properties.size_bytes == 33554432U && properties.page_size == 256U && properties.erase_size == 4096U);
+    CHECK(properties.capabilities == (FLASH_CAP_READ_SINGLE | FLASH_CAP_READ_QUAD | FLASH_CAP_PROGRAM | FLASH_CAP_ERASE));
+    flash_status_t state = {0};
+    CHECK(flash_get_status(NULL, &state) == STM_ERR_INVALID_ARG);
+    CHECK(flash_get_status(d, NULL) == STM_ERR_INVALID_ARG);
+    CHECK(flash_get_status(d, &state) == STM_OK);
+    CHECK(state.valid_mask == 31U && state.flags == FLASH_STATUS_QUAD_ENABLED);
+    registers[0] = 6U; registers[1] = 0xC2U; registers[2] = 4U; stuck_busy = 1;
+    uint32_t before_tick = tick;
+    CHECK(flash_get_status(d, &state) == STM_OK && state.flags == 31U);
+    CHECK(tick == before_tick && info(d).ready);
+    stuck_busy = 0;
+    state.valid_mask = 0xABU; state.flags = 0xCDU;
+    fail_at = calls + 3U;
+    CHECK(flash_get_status(d, &state) == STM_ERR_IO);
+    CHECK(state.valid_mask == 0xABU && state.flags == 0xCDU && !info(d).ready);
+    CHECK(flash_delete(&d) == STM_OK && live_allocations == 0U);
     return 0;
 }

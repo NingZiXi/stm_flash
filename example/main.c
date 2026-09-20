@@ -20,7 +20,7 @@ int main(void)
     board_init();
     flash_handle_t device = NULL;
     const flash_config_t config = {
-        .hal = &hospi1,
+        .bus = {.type = FLASH_BUS_OSPI, .handle.ospi = &hospi1}, .chip = FLASH_CHIP_AUTO,
         .read_mode = FLASH_READ_QUAD,
     };
     example_result = flash_create(&config, &device);
@@ -29,11 +29,13 @@ int main(void)
         example_result = flash_read(device, 0U, data, sizeof(data));
     }
 #if EXAMPLE_FLASH_WRITE_TEST
-    const uint32_t offset = FLASH_SIZE_BYTES - FLASH_SECTOR_BYTES;
+    flash_info_t info = {0};
+    if (example_result == STM_OK) { example_result = flash_get_info(device, &info); }
+    const uint32_t offset = info.size_bytes - info.erase_size;
     const uint8_t expected[] = {0x12U, 0x34U, 0xA5U, 0x5AU};
     // 启用擦写示例会覆盖最后一个扇区。
     if (example_result == STM_OK) {
-        example_result = flash_erase(device, offset, FLASH_SECTOR_BYTES);
+        example_result = flash_erase(device, offset, info.erase_size);
     }
     if (example_result == STM_OK) {
         example_result = flash_write(device, offset + 255U, expected, sizeof(expected));

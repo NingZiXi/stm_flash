@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 project(stm_flash C)
 
 option(STM_FLASH_LINK_CUBEMX "Link stm32cubemx target automatically" ON)
-add_library(stm_flash STATIC stm_flash.c)
+add_library(stm_flash STATIC stm_flash.c private/flash_chips.c private/flash_bus_ospi.c)
 target_compile_features(stm_flash PUBLIC c_std_11)
 target_include_directories(stm_flash PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if(STM_FLASH_LINK_CUBEMX AND TARGET stm32cubemx)

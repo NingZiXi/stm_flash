@@ -84,7 +84,8 @@ def main():
                    "-DUSE_HAL_DRIVER", f"-D{args.mcu}", "-nostdlib",
                    "-Wl,-Ttext=0x11000,-Tdata=0x20000000,-e,test_entry"]
         command += [f"-I{path}" for path in includes]
-        command += [str(COMPONENT / "stm_flash.c"), str(Path(__file__).with_name("test_flash.c")),
+        command += [str(COMPONENT / "stm_flash.c"), str(COMPONENT / "private/flash_chips.c"),
+                    str(COMPONENT / "private/flash_bus_ospi.c"), str(Path(__file__).with_name("test_flash.c")),
                     "-lgcc", "-o", str(binary)]
         subprocess.run(command, check=True)
         with binary.open("rb") as stream:
@@ -92,6 +93,7 @@ def main():
             run(elf, "test_entry")
             run(elf, "test_handle_entry")
             run(elf, "test_multiple_handles_entry")
+            run(elf, "test_v3_entry")
             run(elf, "test_interrupt_entry", interrupt=True)
         print(f"PASS {optimize}: ID/config, 32-bit commands, quad/single reads, page splitting, erase alignment, protection, timeout, partial failure, verify")
 

@@ -1,12 +1,15 @@
 /**
  * @file    stm_flash.c
- * @brief   W25Q256JV-IQ 四字节寻址、分页写入和扇区擦除
+ * @brief   外部 NOR 通用分页、擦除、状态和生命周期实现
  */
-#include "stm_flash.h"
+#include "private/flash_internal.h"
 #include <stdlib.h>
 
 struct flash_context {
-    OSPI_HandleTypeDef *hal;       // 调用者提供并独占的 HAL 句柄
+    void *hal;       // 调用者提供并独占的 HAL 句柄
+    const flash_bus_ops_t *bus;
+    const flash_chip_desc_t *chip;
+    flash_bus_type_t bus_type;
     uint32_t jedec_id;             // 24 位 JEDEC ID
     uint32_t clock_hz;             // 根据 HAL 配置计算的串行时钟，Hz
     HAL_StatusTypeDef last_hal_status;    // 最近一次 HAL 返回值
@@ -18,8 +21,6 @@ struct flash_context {
 static flash_handle_t g_devices = NULL;
 
 #define FLASH_IO_TIMEOUT 100U
-#define FLASH_PROGRAM_TIMEOUT 10U
-#define FLASH_ERASE_TIMEOUT 1000U
 #define FLASH_BUFFER_BYTES 256U
 
 // 阻塞接口要求线程上下文和正常运行的 HAL tick
@@ -44,35 +45,26 @@ static stm_err_t flash_hal_result(flash_handle_t dev, HAL_StatusTypeDef status)
     return flash_fail(dev, status == HAL_TIMEOUT ? STM_ERR_TIMEOUT : STM_ERR_IO);
 }
 
-// 发送单线指令和可选的四字节地址
+// 发送单线指令；地址宽度来自器件描述。
 static stm_err_t flash_command(flash_handle_t dev, uint8_t opcode,
                                         int addressed, uint32_t offset_bytes,
                                         uint32_t count, uint32_t lines, uint32_t dummy)
 {
-    OSPI_RegularCmdTypeDef cmd = {0};
-    cmd.OperationType = HAL_OSPI_OPTYPE_COMMON_CFG;
-    cmd.FlashId = HAL_OSPI_FLASH_ID_1;
-    cmd.Instruction = opcode;
-    cmd.InstructionMode = HAL_OSPI_INSTRUCTION_1_LINE;
-    cmd.InstructionSize = HAL_OSPI_INSTRUCTION_8_BITS;
-    cmd.AddressMode = addressed ? HAL_OSPI_ADDRESS_1_LINE : HAL_OSPI_ADDRESS_NONE;
-    cmd.AddressSize = HAL_OSPI_ADDRESS_32_BITS;
-    cmd.Address = offset_bytes;
-    cmd.AlternateBytesMode = HAL_OSPI_ALTERNATE_BYTES_NONE;
-    cmd.DataMode = count != 0U ? lines : HAL_OSPI_DATA_NONE;
-    cmd.NbData = count;
-    cmd.DummyCycles = dummy;
-    cmd.DQSMode = HAL_OSPI_DQS_DISABLE;
-    cmd.SIOOMode = HAL_OSPI_SIOO_INST_EVERY_CMD;
-    return flash_hal_result(dev, HAL_OSPI_Command(dev->hal, &cmd, FLASH_IO_TIMEOUT));
+    flash_command_t cmd = {
+        .opcode = opcode, .addressed = (uint8_t)addressed,
+        .address_bytes = dev->chip != NULL ? dev->chip->address_bytes : 3U,
+        .data_lines = (uint8_t)lines, .dummy_cycles = (uint8_t)dummy,
+        .address = offset_bytes, .count = count,
+    };
+    return flash_hal_result(dev, dev->bus->command(dev->hal, &cmd, FLASH_IO_TIMEOUT));
 }
 
 // 读取指定状态寄存器
 static stm_err_t flash_status_byte(flash_handle_t dev, uint8_t opcode, uint8_t *value)
 {
-    stm_err_t s = flash_command(dev, opcode, 0, 0U, 1U, HAL_OSPI_DATA_1_LINE, 0U);
+    stm_err_t s = flash_command(dev, opcode, 0, 0U, 1U, 1U, 0U);
     if (s != STM_OK) { return s; }
-    return flash_hal_result(dev, HAL_OSPI_Receive(dev->hal, value, FLASH_IO_TIMEOUT));
+    return flash_hal_result(dev, dev->bus->receive(dev->hal, value, FLASH_IO_TIMEOUT));
 }
 
 // 等待 BUSY 清零，支持 tick 回绕
@@ -81,9 +73,9 @@ static stm_err_t flash_wait(flash_handle_t dev, uint32_t timeout)
     uint32_t start = HAL_GetTick();
     for (;;) {
         uint8_t value;
-        stm_err_t s = flash_status_byte(dev, 0x05U, &value);
+        stm_err_t s = flash_status_byte(dev, dev->chip->status_commands[dev->chip->busy_index], &value);
         if (s != STM_OK) { return s; }
-        if ((value & 1U) == 0U) { return STM_OK; }
+        if ((value & dev->chip->busy_mask) == 0U) { return STM_OK; }
         if ((uint32_t)(HAL_GetTick() - start) >= timeout) {
             return flash_fail(dev, STM_ERR_TIMEOUT);
         }
@@ -98,7 +90,7 @@ static stm_err_t flash_check(flash_handle_t dev, uint32_t offset_bytes,
     if (dev == NULL) { return STM_ERR_INVALID_ARG; }
     if (!flash_context_ok()) { return STM_ERR_INVALID_CONTEXT; }
     if (dev->ready == 0U || dev->hal == NULL) { return STM_ERR_INVALID_STATE; }
-    if (offset_bytes > FLASH_SIZE_BYTES || size_bytes > FLASH_SIZE_BYTES - offset_bytes) {
+    if (offset_bytes > dev->chip->size_bytes || size_bytes > dev->chip->size_bytes - offset_bytes) {
         return STM_ERR_OUT_OF_RANGE;
     }
     if (buffer && size_bytes != 0U) {
@@ -111,12 +103,11 @@ static stm_err_t flash_check(flash_handle_t dev, uint32_t offset_bytes,
     return STM_OK;
 }
 
-// 读取三个状态字节
+// 按器件描述读取状态寄存器
 static stm_err_t flash_status_all(flash_handle_t dev, uint8_t status[3])
 {
-    const uint8_t commands[3] = {0x05U, 0x35U, 0x15U};
-    for (unsigned i = 0U; i < 3U; ++i) {
-        stm_err_t s = flash_status_byte(dev, commands[i], &status[i]);
+    for (unsigned i = 0U; i < dev->chip->status_count; ++i) {
+        stm_err_t s = flash_status_byte(dev, dev->chip->status_commands[i], &status[i]);
         if (s != STM_OK) { return s; }
     }
     return STM_OK;
@@ -126,13 +117,14 @@ static stm_err_t flash_status_all(flash_handle_t dev, uint8_t status[3])
 static stm_err_t flash_write_allowed(flash_handle_t dev)
 {
     uint8_t status[3];
-    stm_err_t s = flash_wait(dev, FLASH_ERASE_TIMEOUT);
+    stm_err_t s = flash_wait(dev, dev->chip->erase_timeout_ms);
     if (s != STM_OK) { return s; }
     s = flash_status_all(dev, status);
     if (s != STM_OK) { return s; }
-    if ((status[1] & 0x80U) != 0U) { return FLASH_ERR_SUSPENDED; }
-    if ((status[0] & 0x3CU) != 0U || (status[1] & 0x40U) != 0U ||
-        (status[2] & 0x04U) != 0U) { return FLASH_ERR_PROTECTED; }
+    flash_status_t decoded;
+    flash_chip_decode_status(dev->chip, status, &decoded);
+    if (decoded.flags & FLASH_STATUS_SUSPENDED) { return FLASH_ERR_SUSPENDED; }
+    if (decoded.flags & FLASH_STATUS_PROTECTED) { return FLASH_ERR_PROTECTED; }
     return STM_OK;
 }
 
@@ -140,67 +132,59 @@ static stm_err_t flash_write_allowed(flash_handle_t dev)
 static stm_err_t flash_write_enable(flash_handle_t dev)
 {
     uint8_t status;
-    stm_err_t s = flash_command(dev, 0x06U, 0, 0U, 0U, HAL_OSPI_DATA_NONE, 0U);
+    stm_err_t s = flash_command(dev, dev->chip->write_enable, 0, 0U, 0U, 0U, 0U);
     if (s != STM_OK) { return s; }
-    s = flash_status_byte(dev, 0x05U, &status);
+    s = flash_status_byte(dev, dev->chip->status_commands[dev->chip->wel_index], &status);
     if (s != STM_OK) { return s; }
-    return (status & 2U) != 0U ? STM_OK : FLASH_ERR_PROTECTED;
+    return (status & dev->chip->wel_mask) != 0U ? STM_OK : FLASH_ERR_PROTECTED;
 }
 
-// 检查外设配置并识别器件
-static stm_err_t flash_init_device(flash_handle_t dev, OSPI_HandleTypeDef *hal,
-                             flash_read_mode_t mode)
+// 先识别型号，再按器件描述校验配置；未知芯片不执行厂商专用操作。
+static stm_err_t flash_init_device(flash_handle_t dev, const flash_config_t *config)
 {
-    if (dev == NULL || hal == NULL) { return STM_ERR_INVALID_ARG; }
-    if (!flash_context_ok()) { return STM_ERR_INVALID_CONTEXT; }
-    if (dev->ready != 0U || (mode != FLASH_READ_SINGLE && mode != FLASH_READ_QUAD)) {
+    dev->hal = config->bus.handle.ospi;
+    dev->bus = &flash_ospi_ops;
+    dev->bus_type = config->bus.type;
+    dev->read_mode = config->read_mode;
+    if (config->read_mode != FLASH_READ_SINGLE && config->read_mode != FLASH_READ_QUAD) {
         return STM_ERR_INVALID_CONFIG;
     }
-    uint32_t kernel = __HAL_RCC_GET_OSPI_SOURCE() == RCC_OSPICLKSOURCE_HCLK
-                          ? HAL_RCC_GetHCLKFreq() : 0U;
-    if ((hal->Instance != OCTOSPI1 && hal->Instance != OCTOSPI2) ||
-        HAL_OSPI_GetState(hal) != HAL_OSPI_STATE_READY ||
-        hal->Init.DeviceSize != 25U || hal->Init.DualQuad != HAL_OSPI_DUALQUAD_DISABLE ||
-        hal->Init.MemoryType != HAL_OSPI_MEMTYPE_MICRON ||
-        hal->Init.ClockMode != HAL_OSPI_CLOCK_MODE_0 ||
-        hal->Init.WrapSize != HAL_OSPI_WRAP_NOT_SUPPORTED ||
-        hal->Init.ChipSelectBoundary != 0U ||
-        hal->Init.FreeRunningClock != HAL_OSPI_FREERUNCLK_DISABLE ||
-        hal->Init.ClockPrescaler == 0U || hal->Init.ClockPrescaler > 256U ||
-        hal->Init.ChipSelectHighTime < 4U || kernel == 0U ||
-        (uint64_t)kernel > (uint64_t)50000000U * hal->Init.ClockPrescaler) {
-        return STM_ERR_INVALID_CONFIG;
-    }
-    dev->hal = hal;
-    dev->read_mode = mode;
-    dev->jedec_id = 0U;
-    dev->clock_hz = kernel / hal->Init.ClockPrescaler;
-    dev->last_hal_status = HAL_OK;
-    stm_err_t s = flash_wait(dev, FLASH_ERASE_TIMEOUT);
+    stm_err_t s = dev->bus->validate(dev->hal, &dev->clock_hz);
     if (s != STM_OK) { return s; }
     uint8_t id[3];
-    s = flash_command(dev, 0x9FU, 0, 0U, 3U, HAL_OSPI_DATA_1_LINE, 0U);
+    s = flash_command(dev, 0x9FU, 0, 0U, 3U, 1U, 0U);
     if (s != STM_OK) { return s; }
-    s = flash_hal_result(dev, HAL_OSPI_Receive(hal, id, FLASH_IO_TIMEOUT));
+    s = flash_hal_result(dev, dev->bus->receive(dev->hal, id, FLASH_IO_TIMEOUT));
     if (s != STM_OK) { return s; }
     dev->jedec_id = ((uint32_t)id[0] << 16U) | ((uint32_t)id[1] << 8U) | id[2];
-    if (dev->jedec_id != FLASH_JEDEC_ID) { return STM_ERR_NOT_SUPPORTED; }
-    uint8_t status[3];
-    s = flash_status_all(dev, status);
+    dev->chip = flash_chip_find(dev->jedec_id, config->chip);
+    if (dev->chip == NULL) { return STM_ERR_NOT_SUPPORTED; }
+    s = dev->bus->geometry(dev->hal, dev->chip->size_bytes, dev->chip->max_clock_hz);
     if (s != STM_OK) { return s; }
-    if ((status[1] & 0x80U) != 0U) { return FLASH_ERR_SUSPENDED; }
-    if (mode == FLASH_READ_QUAD && (status[1] & 2U) == 0U) {
-        return STM_ERR_INVALID_CONFIG;
-    }
+    uint32_t capability = config->read_mode == FLASH_READ_QUAD ? FLASH_CAP_READ_QUAD : FLASH_CAP_READ_SINGLE;
+    if (!(dev->chip->capabilities & capability)) { return STM_ERR_NOT_SUPPORTED; }
+    s = flash_wait(dev, dev->chip->erase_timeout_ms);
+    if (s != STM_OK) { return s; }
+    uint8_t raw[3] = {0};
+    s = flash_status_all(dev, raw);
+    if (s != STM_OK) { return s; }
+    flash_status_t status;
+    flash_chip_decode_status(dev->chip, raw, &status);
+    if (status.flags & FLASH_STATUS_SUSPENDED) { return FLASH_ERR_SUSPENDED; }
+    if (config->read_mode == FLASH_READ_QUAD && (status.valid_mask & FLASH_STATUS_QUAD_ENABLED) &&
+        !(status.flags & FLASH_STATUS_QUAD_ENABLED)) { return STM_ERR_INVALID_CONFIG; }
     dev->ready = 1U;
     return STM_OK;
 }
 
-// 读取状态寄存器
-stm_err_t flash_read_status(flash_handle_t dev, uint8_t status[3])
+stm_err_t flash_get_status(flash_handle_t dev, flash_status_t *status)
 {
-    stm_err_t s = flash_check(dev, 0U, status, 3U, 1);
-    return s == STM_OK ? flash_status_all(dev, status) : s;
+    stm_err_t s = flash_check(dev, 0U, status, sizeof(*status), 1);
+    if (s != STM_OK) { return s; }
+    uint8_t raw[3] = {0};
+    s = flash_status_all(dev, raw);
+    if (s == STM_OK) { flash_chip_decode_status(dev->chip, raw, status); }
+    return s;
 }
 
 // 读取连续字节
@@ -208,23 +192,22 @@ stm_err_t flash_read(flash_handle_t dev, uint32_t offset_bytes, void *data, size
 {
     stm_err_t s = flash_check(dev, offset_bytes, data, size_bytes, 1);
     if (s != STM_OK || size_bytes == 0U) { return s; }
-    s = flash_wait(dev, FLASH_ERASE_TIMEOUT);
+    s = flash_wait(dev, dev->chip->erase_timeout_ms);
     if (s != STM_OK) { return s; }
-    uint8_t status;
-    s = flash_status_byte(dev, 0x35U, &status);
+    flash_status_t status;
+    s = flash_get_status(dev, &status);
     if (s != STM_OK) { return s; }
-    if ((status & 0x80U) != 0U) { return FLASH_ERR_SUSPENDED; }
-    if (dev->read_mode == FLASH_READ_QUAD && (status & 2U) == 0U) {
-        return flash_fail(dev, STM_ERR_INVALID_CONFIG);
-    }
+    if (status.flags & FLASH_STATUS_SUSPENDED) { return FLASH_ERR_SUSPENDED; }
+    if (dev->read_mode == FLASH_READ_QUAD && (status.valid_mask & FLASH_STATUS_QUAD_ENABLED) &&
+        !(status.flags & FLASH_STATUS_QUAD_ENABLED)) { return flash_fail(dev, STM_ERR_INVALID_CONFIG); }
     uint8_t *out = data;
     while (size_bytes != 0U) {
         uint32_t count = size_bytes > 4096U ? 4096U : (uint32_t)size_bytes;
         int quad = dev->read_mode == FLASH_READ_QUAD;
-        s = flash_command(dev, quad ? 0x6CU : 0x13U, 1, offset_bytes, count,
-                          quad ? HAL_OSPI_DATA_4_LINES : HAL_OSPI_DATA_1_LINE, quad ? 8U : 0U);
+        s = flash_command(dev, quad ? dev->chip->read_quad : dev->chip->read_single, 1, offset_bytes, count,
+                          quad ? 4U : 1U, quad ? dev->chip->quad_dummy : 0U);
         if (s != STM_OK) { return s; }
-        s = flash_hal_result(dev, HAL_OSPI_Receive(dev->hal, out, FLASH_IO_TIMEOUT));
+        s = flash_hal_result(dev, dev->bus->receive(dev->hal, out, FLASH_IO_TIMEOUT));
         if (s != STM_OK) { return s; }
         offset_bytes += count; out += count; size_bytes -= count;
     }
@@ -270,15 +253,15 @@ stm_err_t flash_write(flash_handle_t dev, uint32_t offset_bytes, const void *dat
     if (s != STM_OK) { return s; }
     const uint8_t *in = data;
     while (size_bytes != 0U) {
-        uint32_t count = FLASH_PAGE_BYTES - offset_bytes % FLASH_PAGE_BYTES;
+        uint32_t count = dev->chip->page_size - offset_bytes % dev->chip->page_size;
         if (size_bytes < count) { count = (uint32_t)size_bytes; }
         s = flash_write_enable(dev);
         if (s != STM_OK) { return s; }
-        s = flash_command(dev, 0x12U, 1, offset_bytes, count, HAL_OSPI_DATA_1_LINE, 0U);
+        s = flash_command(dev, dev->chip->program, 1, offset_bytes, count, 1U, 0U);
         if (s != STM_OK) { return s; }
-        s = flash_hal_result(dev, HAL_OSPI_Transmit(dev->hal, (uint8_t *)in, FLASH_IO_TIMEOUT));
+        s = flash_hal_result(dev, dev->bus->transmit(dev->hal, (uint8_t *)in, FLASH_IO_TIMEOUT));
         if (s != STM_OK) { return s; }
-        s = flash_wait(dev, FLASH_PROGRAM_TIMEOUT);
+        s = flash_wait(dev, dev->chip->program_timeout_ms);
         if (s != STM_OK) { return s; }
         s = flash_compare(dev, offset_bytes, in, count, 0);
         if (s != STM_OK) { return s; }
@@ -287,12 +270,12 @@ stm_err_t flash_write(flash_handle_t dev, uint32_t offset_bytes, const void *dat
     return STM_OK;
 }
 
-// 按 4 KiB 擦除并检查擦除结果
+// 按器件擦除粒度操作并检查结果
 stm_err_t flash_erase(flash_handle_t dev, uint32_t offset_bytes, size_t size_bytes)
 {
     stm_err_t s = flash_check(dev, offset_bytes, NULL, size_bytes, 0);
     if (s != STM_OK) { return s; }
-    if (offset_bytes % FLASH_SECTOR_BYTES != 0U || size_bytes % FLASH_SECTOR_BYTES != 0U) {
+    if (offset_bytes % dev->chip->erase_size != 0U || size_bytes % dev->chip->erase_size != 0U) {
         return STM_ERR_INVALID_ARG;
     }
     if (size_bytes == 0U) { return STM_OK; }
@@ -301,13 +284,13 @@ stm_err_t flash_erase(flash_handle_t dev, uint32_t offset_bytes, size_t size_byt
     while (size_bytes != 0U) {
         s = flash_write_enable(dev);
         if (s != STM_OK) { return s; }
-        s = flash_command(dev, 0x21U, 1, offset_bytes, 0U, HAL_OSPI_DATA_NONE, 0U);
+        s = flash_command(dev, dev->chip->erase, 1, offset_bytes, 0U, 0U, 0U);
         if (s != STM_OK) { return s; }
-        s = flash_wait(dev, FLASH_ERASE_TIMEOUT);
+        s = flash_wait(dev, dev->chip->erase_timeout_ms);
         if (s != STM_OK) { return s; }
-        s = flash_compare(dev, offset_bytes, NULL, FLASH_SECTOR_BYTES, 0);
+        s = flash_compare(dev, offset_bytes, NULL, dev->chip->erase_size, 0);
         if (s != STM_OK) { return s; }
-        offset_bytes += FLASH_SECTOR_BYTES; size_bytes -= FLASH_SECTOR_BYTES;
+        offset_bytes += dev->chip->erase_size; size_bytes -= dev->chip->erase_size;
     }
     return STM_OK;
 }
@@ -315,16 +298,18 @@ stm_err_t flash_erase(flash_handle_t dev, uint32_t offset_bytes, size_t size_byt
 // 创建对象并独占对应外设
 stm_err_t flash_create(const flash_config_t *config, flash_handle_t *out_handle)
 {
-    if (config == NULL || out_handle == NULL || config->hal == NULL) { return STM_ERR_INVALID_ARG; }
+    if (config == NULL || out_handle == NULL) { return STM_ERR_INVALID_ARG; }
+    if (config->bus.type != FLASH_BUS_OSPI) { return STM_ERR_NOT_SUPPORTED; }
+    if (config->bus.handle.ospi == NULL) { return STM_ERR_INVALID_ARG; }
     if (*out_handle != NULL) { return STM_ERR_INVALID_STATE; }
     if (__get_IPSR() != 0U || __get_PRIMASK() != 0U ||
         __get_BASEPRI() != 0U || __get_FAULTMASK() != 0U) { return STM_ERR_INVALID_CONTEXT; }
     for (flash_handle_t it = g_devices; it != NULL; it = it->next) {
-        if (it->hal->Instance == config->hal->Instance) { return STM_ERR_INVALID_STATE; }
+        if (it->bus_type == config->bus.type && it->bus->identity(it->hal) == flash_ospi_ops.identity(config->bus.handle.ospi)) { return STM_ERR_INVALID_STATE; }
     }
     flash_handle_t dev = calloc(1U, sizeof(*dev));
     if (dev == NULL) { return STM_ERR_NO_MEM; }
-    stm_err_t err = flash_init_device(dev, config->hal, config->read_mode);
+    stm_err_t err = flash_init_device(dev, config);
     if (err != STM_OK) { free(dev); return err; }
     dev->next = g_devices;
     g_devices = dev;
@@ -353,6 +338,12 @@ stm_err_t flash_delete(flash_handle_t *handle)
 stm_err_t flash_get_info(flash_handle_t handle, flash_info_t *info)
 {
     if (handle == NULL || info == NULL) { return STM_ERR_INVALID_ARG; }
+    info->chip = handle->chip->chip;
+    info->bus_type = handle->bus_type;
+    info->size_bytes = handle->chip->size_bytes;
+    info->page_size = handle->chip->page_size;
+    info->erase_size = handle->chip->erase_size;
+    info->capabilities = handle->chip->capabilities;
     info->jedec_id = handle->jedec_id;
     info->clock_hz = handle->clock_hz;
     info->last_hal_status = handle->last_hal_status;
