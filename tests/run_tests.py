@@ -43,6 +43,7 @@ def main():
     parser = argparse.ArgumentParser(description="Build and run Flash software tests without hardware")
     parser.add_argument("--project-root", type=Path, help="CubeMX H7 project providing HAL/CMSIS headers")
     parser.add_argument("--include", action="append", type=Path, help="Explicit HAL/config/CMSIS include directory; repeatable")
+    parser.add_argument("--bus", choices=["ospi", "qspi"], default="ospi", help="HAL backend under test")
     parser.add_argument("--mcu", default="STM32H723xx", help="STM32H7 Cortex-M7 device macro")
     parser.add_argument("--compiler", default="arm-none-eabi-gcc", help="ARM GCC executable name or path")
     parser.add_argument("--build-dir", type=Path, help="Output directory")
@@ -62,7 +63,7 @@ def main():
     if not project and not args.include:
         project = next((p for p in COMPONENT.parents if (p / "Core/Inc").is_dir()
                         and (p / "Drivers/STM32H7xx_HAL_Driver/Inc").is_dir()), None)
-    includes = [COMPONENT, COMPONENT.parent / "stm_common"]
+    includes = [COMPONENT / "include", COMPONENT / "adapters/stm32_hal", COMPONENT.parent / "stm_common"]
     if project:
         includes += [project / path for path in ("Core/Inc", "Drivers/STM32H7xx_HAL_Driver/Inc",
                      "Drivers/CMSIS/Device/ST/STM32H7xx/Include", "Drivers/CMSIS/Include")]
@@ -83,16 +84,22 @@ def main():
                    "-std=c11", optimize, "-g", "-Wall", "-Wextra", "-Werror", "-fno-builtin",
                    "-DUSE_HAL_DRIVER", f"-D{args.mcu}", "-nostdlib",
                    "-Wl,-Ttext=0x11000,-Tdata=0x20000000,-e,test_entry"]
+        if args.bus == "qspi":
+            command += ["-DFLASH_TEST_QSPI=1", "-DCORE_CM7"]
         command += [f"-I{path}" for path in includes]
-        command += [str(COMPONENT / "stm_flash.c"), str(COMPONENT / "private/flash_chips.c"),
-                    str(COMPONENT / "private/flash_bus_ospi.c"), str(Path(__file__).with_name("test_flash.c")),
+        command += ['-DSTM_FLASH_HAL_HEADER="stm32h7xx_hal.h"']
+        command += [str(p) for p in sorted((COMPONENT / "src").rglob("*.c"))]
+        command += [str(COMPONENT / "adapters/stm32_hal" / ("flash_" + args.bus + ".c")),
+                    str(Path(__file__).with_name("test_flash.c")),
                     "-lgcc", "-o", str(binary)]
         subprocess.run(command, check=True)
         with binary.open("rb") as stream:
             elf = ELFFile(stream)
             run(elf, "test_entry")
             run(elf, "test_handle_entry")
-            run(elf, "test_multiple_handles_entry")
+            if args.bus == "ospi":
+                run(elf, "test_multiple_handles_entry")
+            run(elf, "test_gd25q_entry")
             run(elf, "test_v3_entry")
             run(elf, "test_interrupt_entry", interrupt=True)
         print(f"PASS {optimize}: ID/config, 32-bit commands, quad/single reads, page splitting, erase alignment, protection, timeout, partial failure, verify")
