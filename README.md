@@ -5,6 +5,21 @@
 同步串行 NOR 库。核心仅依赖 C 标准库与 `stm_common`，没有 HAL/CMSIS/RTOS 依赖。
 应用组合 **器件描述符 + host 操作表 + 实例上下文**。本次为破坏性初始化 API 变更；现有 read/write/erase/verify 调用形式保留。
 
+当前发布 **v4.0.1** 为文档补丁，补充支持的 Driver 清单；驱动源码/API 与 v4.0.0 相同，不新增实板验证结论。
+
+## 支持的 Driver
+
+下表列出当前源码内置的器件 Driver 和控制器后端；器件参数支持不等于每种器件/控制器组合都通过实板验证。
+
+| 类型 | Driver / 型号 | 源码或接入入口 | 支持范围与限制 |
+| --- | --- | --- | --- |
+| NOR 器件 | GD25Q256E | [`flash_device_gd25q256e`](src/devices/gd25q256e.c) | 32 MiB；JEDEC `0xC84019`；256 B 页、4 KiB 擦除块；单线 / 1-1-4 读取；保守上限 50 MHz |
+| NOR 器件 | W25Q256JV-IQ | [`flash_device_w25q256jv_iq`](src/devices/w25q256jv_iq.c) | 32 MiB；JEDEC `0xEF4019`；256 B 页、4 KiB 擦除块；单线 / 1-1-4 读取；保守上限 50 MHz |
+| 控制器后端 | STM32 HAL QSPI | [`flash_qspi_bind()`](adapters/stm32_hal/flash_qspi.h)；target `stm_flash_qspi` | `STM_FLASH_WITH_QSPI=ON`；当前覆盖 H757 QSPI，阻塞间接传输 |
+| 控制器后端 | STM32 HAL OSPI | [`flash_ospi_bind()`](adapters/stm32_hal/flash_ospi.h)；target `stm_flash_ospi` | `STM_FLASH_WITH_OSPI=ON`；当前覆盖 H723 OSPI，仅使用上述 NOR 的 SDR 协议，不支持八线 OPI/DTR |
+
+内置器件可按 CMake 选项裁剪；当前没有普通 SPI、并行 NOR 或 NAND 的内置后端。自定义器件/host 属于扩展接口，不是现成支持清单。四线读取要求 QE 已有效，组件不自动修改非易失寄存器。
+
 ## 结构
 
 - `include/stm_flash.h`：应用 API、统一错误与诊断。
