@@ -8,7 +8,7 @@
 extern "C"
 {
 #endif
-#define STM_FLASH_VERSION "4.0.0"
+#define STM_FLASH_VERSION "4.1.0"
 #define FLASH_ERR_BASE ((stm_err_t)0x1000)
 #define FLASH_ERR_PROTECTED (FLASH_ERR_BASE + 1)
 #define FLASH_ERR_NEEDS_ERASE (FLASH_ERR_BASE + 2)

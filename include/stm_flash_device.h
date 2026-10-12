@@ -74,6 +74,7 @@ extern "C"
     stm_err_t flash_nor_erase_sector(const flash_chip_io_t *io, uint32_t offset);
     stm_err_t flash_nor_wait_ready(const flash_chip_io_t *io, uint32_t timeout_ms);
     extern const flash_chip_ops_t flash_nor_ops;
+    extern const flash_device_t flash_device_gd25q128; // GD25Q128C/E 公共单线子集，不推断型号后缀。
     extern const flash_device_t flash_device_gd25q256e;
     extern const flash_device_t flash_device_w25q256jv_iq;
 /* 描述符和 ops 使用期间必须有效；推荐静态 const，每个实例共享。 */

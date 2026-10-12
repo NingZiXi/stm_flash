@@ -1,5 +1,8 @@
 /** @file flash_registry.c @brief 只匹配已启用器件；未知/歧义拒绝初始化。 */
 #include "flash_internal.h"
+#ifndef STM_FLASH_ENABLE_GD25Q128
+#define STM_FLASH_ENABLE_GD25Q128 1
+#endif
 #ifndef STM_FLASH_ENABLE_GD25Q256E
 #define STM_FLASH_ENABLE_GD25Q256E 1
 #endif
@@ -7,6 +10,9 @@
 #define STM_FLASH_ENABLE_W25Q256JV_IQ 1
 #endif
 static const flash_device_t *const builtin[] = {
+#if STM_FLASH_ENABLE_GD25Q128
+    &flash_device_gd25q128,
+#endif
 #if STM_FLASH_ENABLE_GD25Q256E
     &flash_device_gd25q256e,
 #endif

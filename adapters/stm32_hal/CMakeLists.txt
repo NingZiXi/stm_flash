@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-foreach(bus QSPI OSPI)
+foreach(bus SPI QSPI OSPI)
     option(STM_FLASH_WITH_${bus} "Build the STM32 HAL ${bus} adapter" OFF)
     if(STM_FLASH_WITH_${bus})
         string(TOLOWER ${bus} name)
